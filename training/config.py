@@ -48,7 +48,7 @@ class TrainingConfig:
     grad_clip: float = 1.0
 
     # Optimization
-    freeze_vision_epochs: int = 5
+    freeze_vision_epochs: int = 100  # Keep vision encoder frozen (prevents overfitting)
     use_amp: bool = True  # Mixed precision training
     augment: bool = True
 
@@ -66,6 +66,11 @@ class TrainingConfig:
     output_dir: Optional[str] = None  # Defaults to training/checkpoints
     save_every: int = 10  # Save checkpoint every N epochs
     log_interval: int = 200  # Log every N batches
+
+    # Early stopping
+    early_stopping: bool = True
+    early_stopping_patience: int = 10  # Stop if no improvement for N epochs
+    early_stopping_min_delta: float = 0.001  # Minimum improvement to reset patience
 
     # W&B logging
     wandb: bool = False

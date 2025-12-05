@@ -172,6 +172,13 @@ def main():
         help="Use a preset configuration (default, fast, debug, full)",
     )
 
+    # Add resume option
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from latest checkpoint",
+    )
+
     # Add all config arguments with defaults
     TrainingConfig.add_argparse_args(parser)
 
@@ -270,11 +277,29 @@ def main():
     # Training loop
     best_val_loss = float("inf")
     global_step = 0
+    start_epoch = 0
+    epochs_without_improvement = 0
+
+    # Resume from checkpoint if requested
+    checkpoint_path = output_dir / "pickandplace_latest.pt"
+    if args.resume and checkpoint_path.exists():
+        print(f"Resuming from checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        policy.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"]
+        best_val_loss = checkpoint.get("val_loss", float("inf"))
+        # Advance scheduler to correct position
+        for _ in range(start_epoch):
+            scheduler.step()
+        print(f"Resumed from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
 
     print(f"\nStarting training for {config.epochs} epochs...")
     print(f"Checkpoints: {output_dir}")
+    if config.early_stopping:
+        print(f"Early stopping: patience={config.early_stopping_patience}, min_delta={config.early_stopping_min_delta}")
 
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, config.epochs):
         # Unfreeze vision encoder after N epochs
         if vision_frozen and epoch >= config.freeze_vision_epochs:
             unfreeze_vision_encoder(policy)
@@ -321,13 +346,23 @@ def main():
         # Save latest
         torch.save(checkpoint, output_dir / "pickandplace_latest.pt")
 
-        # Save best
-        if val_loss < best_val_loss:
+        # Save best and check early stopping
+        if val_loss < best_val_loss - config.early_stopping_min_delta:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             torch.save(checkpoint, output_dir / "pickandplace_best.pt")
             print(f"New best model! Val loss: {val_loss:.4f}")
             logger.set_summary("best_val_loss", best_val_loss)
             logger.set_summary("best_epoch", epoch + 1)
+        else:
+            epochs_without_improvement += 1
+            if config.early_stopping:
+                print(f"No improvement for {epochs_without_improvement}/{config.early_stopping_patience} epochs")
+
+        # Early stopping check
+        if config.early_stopping and epochs_without_improvement >= config.early_stopping_patience:
+            print(f"\nEarly stopping triggered! No improvement for {config.early_stopping_patience} epochs.")
+            break
 
         # Save periodic checkpoint
         if (epoch + 1) % config.save_every == 0:
