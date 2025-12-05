@@ -310,13 +310,16 @@ def get_libero_dataloaders(
 
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
-    # Create dataloaders
+    # Create dataloaders with optimized settings for GPU utilization
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=4 if num_workers > 0 else None,
+        drop_last=True,  # Ensures consistent batch sizes for better GPU utilization
     )
 
     val_loader = DataLoader(
@@ -325,6 +328,8 @@ def get_libero_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     return train_loader, val_loader

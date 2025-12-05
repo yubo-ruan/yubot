@@ -78,6 +78,7 @@ class PickAndPlaceFlowPolicy(nn.Module):
         proprio_dim: int = 8,   # ee_pos(3) + ee_ori(3) + gripper(2)
         goal_dim: int = 6,      # pick_pos(3) + place_pos(3)
         pretrained_vision: bool = True,
+        dropout: float = 0.0,   # Dropout rate for regularization
     ):
         super().__init__()
 
@@ -92,6 +93,7 @@ class PickAndPlaceFlowPolicy(nn.Module):
         self.proprio_encoder = nn.Sequential(
             nn.Linear(proprio_dim, 64),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(64, hidden_dim),
         )
 
@@ -99,6 +101,7 @@ class PickAndPlaceFlowPolicy(nn.Module):
         self.goal_encoder = nn.Sequential(
             nn.Linear(goal_dim, 64),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(64, hidden_dim),
         )
 
@@ -114,6 +117,7 @@ class PickAndPlaceFlowPolicy(nn.Module):
         self.fuse = nn.Sequential(
             nn.Linear(hidden_dim * 4, hidden_dim * 2),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.SiLU(),
         )
@@ -124,10 +128,13 @@ class PickAndPlaceFlowPolicy(nn.Module):
         self.flow_net = nn.Sequential(
             nn.Linear(flow_input_dim, 512),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(512, 512),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(512, 512),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(512, action_dim * chunk_size),
         )
 

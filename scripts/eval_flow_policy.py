@@ -12,7 +12,6 @@ import json
 import os
 import sys
 from datetime import datetime
-from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
 import numpy as np
@@ -453,9 +452,10 @@ def run_episode(
             if done:
                 break
 
-        # Check success
-        if info.get("success", False) or done:
-            success = info.get("success", False)
+        # Check success - in LIBERO, done = _check_success(), so done implies success
+        # Only break on actual success, not on other termination conditions
+        if done:
+            success = done  # LIBERO sets done = success
             break
 
     return {
@@ -469,7 +469,12 @@ def run_episode(
 
 
 def run_single_task(task_args: dict) -> dict:
-    """Run evaluation for a single task (used for parallel execution)."""
+    """Run evaluation for a single task.
+
+    Supports two modes:
+    1. Pre-computed grounding: If 'grounding_result' is provided, uses it directly (for parallel execution)
+    2. Live grounding: If 'grounder' is provided, uses it for VLM grounding (for sequential execution)
+    """
     task_id = task_args["task_id"]
     task_suite = task_args["task_suite"]
     checkpoint = task_args["checkpoint"]
@@ -480,6 +485,8 @@ def run_single_task(task_args: dict) -> dict:
     save_videos = task_args["save_videos"]
     output_dir = task_args["output_dir"]
     seed = task_args["seed"]
+    grounder = task_args.get("grounder", None)  # Optional shared grounder
+    grounding_result = task_args.get("grounding_result", None)  # Pre-computed grounding
 
     # Set seeds
     np.random.seed(seed + task_id)
@@ -516,14 +523,29 @@ def run_single_task(task_args: dict) -> dict:
     env, task_description = make_libero_env(task_suite, task_id)
     print(f"[Task {task_id}] Task: {task_description}")
 
-    # Initialize VLM grounder
-    print(f"[Task {task_id}] Loading VLM grounder...")
-    grounder = QwenSemanticGrounder()
-    grounder.load_model()
-
-    # Get initial obs to extract 6-dim goal
+    # Get initial obs
     init_obs = env.reset()
-    goal, pick_obj, place_target = extract_goal_6d(init_obs, task_description, grounder)
+
+    # Use pre-computed grounding or compute live
+    if grounding_result is not None:
+        # Use pre-computed grounding (for parallel execution)
+        pick_obj = grounding_result["pick_object"]
+        place_target = grounding_result["place_target"]
+        # Re-extract positions from current obs (positions may vary per reset)
+        pick_pos = find_object_position(init_obs, pick_obj)
+        place_pos = find_object_position(init_obs, place_target)
+        place_pos[2] += 0.05  # Height offset
+        goal = np.concatenate([pick_pos, place_pos])
+        print(f"  Using pre-computed grounding: pick={pick_obj}, place={place_target}")
+    elif grounder is not None:
+        # Use shared grounder (for sequential execution)
+        goal, pick_obj, place_target = extract_goal_6d(init_obs, task_description, grounder)
+    else:
+        # Load VLM (fallback for single-task mode)
+        print(f"[Task {task_id}] Loading VLM grounder...")
+        grounder = QwenSemanticGrounder()
+        grounder.load_model()
+        goal, pick_obj, place_target = extract_goal_6d(init_obs, task_description, grounder)
 
     # Log goal extraction
     print(f"[Task {task_id}] Pick object: {pick_obj}, Place target: {place_target}")
@@ -578,7 +600,8 @@ def run_single_task(task_args: dict) -> dict:
     success_rate = np.mean(successes)
     print(f"[Task {task_id}] Success rate: {success_rate:.1%} ({sum(successes)}/{len(successes)})")
 
-    # Save results
+    # Save results (exclude non-serializable objects like grounder)
+    serializable_args = {k: v for k, v in task_args.items() if k != "grounder"}
     summary = {
         "task_suite": task_suite,
         "task_id": task_id,
@@ -593,7 +616,7 @@ def run_single_task(task_args: dict) -> dict:
             "place_pos": goal[3:6].tolist(),
         },
         "results": results,
-        "args": task_args,
+        "args": serializable_args,
     }
 
     summary_path = run_dir / "summary.json"
@@ -631,12 +654,6 @@ def main():
         nargs="+",
         default=None,
         help="Multiple task IDs to run in parallel (e.g., --task_ids 4 5 8 9)",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=4,
-        help="Number of parallel workers for multi-task evaluation",
     )
     parser.add_argument(
         "--num_episodes",
@@ -680,6 +697,12 @@ def main():
         default=42,
         help="Random seed",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for policy evaluation (VLM grounding is always sequential)",
+    )
     args = parser.parse_args()
 
     # Determine task IDs to run
@@ -690,9 +713,57 @@ def main():
     else:
         task_ids = [0]  # Default to task 0
 
-    # Build task arguments for each task
+    # ========== PHASE 1: VLM Grounding (Sequential, single VLM instance) ==========
+    print("=" * 60)
+    print("PHASE 1: VLM Grounding (sequential)")
+    print("=" * 60)
+    print("Loading VLM grounder...")
+    grounder = QwenSemanticGrounder()
+    grounder.load_model()
+    print("VLM grounder ready.\n")
+
+    # Pre-compute grounding for all tasks
+    grounding_results = {}
+    for tid in task_ids:
+        print(f"[Task {tid}] Grounding...")
+        # Create temp environment to get task description and initial obs
+        env, task_description = make_libero_env(args.task_suite, tid)
+        init_obs = env.reset()
+
+        # Build objects and run VLM grounding
+        objects = build_objects_from_obs(init_obs)
+        result = grounder.ground(task_description, objects)
+
+        if result.valid:
+            grounding_results[tid] = {
+                "pick_object": result.source_object,
+                "place_target": result.target_location,
+                "task_description": task_description,
+            }
+            print(f"  pick={result.source_object}, place={result.target_location}")
+        else:
+            print(f"  ERROR: {result.error}")
+            grounding_results[tid] = None
+
+        env.close()
+
+    # Unload VLM to free GPU memory for parallel policy execution
+    print("\nUnloading VLM to free GPU memory...")
+    del grounder
+    torch.cuda.empty_cache()
+    print("VLM unloaded.\n")
+
+    # ========== PHASE 2: Policy Evaluation (Parallel or Sequential) ==========
+    print("=" * 60)
+    print("PHASE 2: Policy Evaluation")
+    print("=" * 60)
+
+    # Build task arguments with pre-computed grounding
     task_args_list = []
     for tid in task_ids:
+        if grounding_results[tid] is None:
+            print(f"[Task {tid}] Skipping due to grounding failure")
+            continue
         task_args_list.append({
             "task_id": tid,
             "task_suite": args.task_suite,
@@ -704,21 +775,28 @@ def main():
             "save_videos": args.save_videos,
             "output_dir": args.output_dir,
             "seed": args.seed,
+            "grounding_result": grounding_results[tid],  # Pre-computed grounding
         })
 
-    # Run tasks
-    if len(task_ids) == 1:
-        # Single task: run directly
-        print(f"Running single task: {task_ids[0]}")
-        summaries = [run_single_task(task_args_list[0])]
-    else:
-        # Multiple tasks: run in parallel
-        num_workers = min(args.num_workers, len(task_ids))
-        print(f"Running {len(task_ids)} tasks in parallel with {num_workers} workers")
-        print(f"Task IDs: {task_ids}")
+    num_workers = min(args.num_workers, len(task_args_list))
 
+    if num_workers > 1:
+        # Parallel execution (no VLM needed, just policy + env)
+        # Use 'spawn' method to avoid CUDA re-initialization issues in forked processes
+        import multiprocessing as mp
+        mp.set_start_method('spawn', force=True)
+        from multiprocessing import Pool
+        print(f"Running {len(task_args_list)} tasks in parallel with {num_workers} workers")
+        print(f"Task IDs: {[t['task_id'] for t in task_args_list]}")
         with Pool(processes=num_workers) as pool:
             summaries = pool.map(run_single_task, task_args_list)
+    else:
+        # Sequential execution
+        print(f"Running {len(task_args_list)} tasks sequentially")
+        print(f"Task IDs: {[t['task_id'] for t in task_args_list]}")
+        summaries = []
+        for task_args in task_args_list:
+            summaries.append(run_single_task(task_args))
 
     # Print overall summary
     print(f"\n{'='*60}")

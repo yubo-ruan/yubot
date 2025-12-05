@@ -2,10 +2,17 @@
 """Train PickAndPlace flow matching policy on LIBERO demos.
 
 Usage:
-    python training/train_pickandplace.py --libero_dir /path/to/libero/datasets
+    # Run with default config (optimized for RTX 4090):
+    python training/train_pickandplace.py
+
+    # Override specific parameters:
+    python training/train_pickandplace.py --batch_size 128 --lr 2e-4
+
+    # Use a preset config:
+    python training/train_pickandplace.py --preset fast
 
     # With W&B logging:
-    python training/train_pickandplace.py --libero_dir /path/to/libero/datasets --wandb
+    python training/train_pickandplace.py --wandb
 
 The script expects LIBERO demo files in:
     {libero_dir}/libero_spatial/*.hdf5
@@ -38,6 +45,7 @@ sys.path.insert(0, str(YUBOT_DIR))
 from src.policy.flow_policy import PickAndPlaceFlowPolicy, flow_matching_loss
 from training.data.libero_dataset import get_libero_dataloaders
 from training.wandb_logger import WandbLogger
+from training.config import TrainingConfig, get_preset, CONFIGS
 
 
 def freeze_vision_encoder(policy: nn.Module):
@@ -115,11 +123,11 @@ def train_epoch(
                 "train/step": global_step,
             })
 
-            # Log sample image every 200 steps
-            if batch_idx % (log_interval * 4) == 0:
-                logger.log_image("samples/input_image", image[0])
-                logger.log_histogram("samples/actions", actions.cpu().numpy().flatten())
-                logger.log_histogram("samples/goal", goal.cpu().numpy().flatten())
+            # Sample logging disabled for training speed
+            # if batch_idx % (log_interval * 4) == 0:
+            #     logger.log_image("samples/input_image", image[0])
+            #     logger.log_histogram("samples/actions", actions.cpu().numpy().flatten())
+            #     logger.log_histogram("samples/goal", goal.cpu().numpy().flatten())
 
     return total_loss / num_batches, global_step
 
@@ -149,76 +157,73 @@ def validate(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train PickAndPlace flow policy")
-    parser.add_argument(
-        "--libero_dir",
-        type=str,
-        required=True,
-        help="Path to LIBERO datasets directory",
+    # Build parser with config defaults
+    parser = argparse.ArgumentParser(
+        description="Train PickAndPlace flow policy",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,  # Will default to training/checkpoints
-        help="Directory to save checkpoints (default: training/checkpoints)",
-    )
-    parser.add_argument("--chunk_size", type=int, default=16, help="Action chunk size")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to use")
-    parser.add_argument("--num_workers", type=int, default=4, help="Dataloader workers")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision training")
-    parser.add_argument("--freeze_vision_epochs", type=int, default=0, help="Freeze vision encoder for first N epochs")
-    parser.add_argument("--temporal_stride", type=int, default=1, help="Sample every Nth timestep")
-    parser.add_argument("--augment", action="store_true", help="Enable data augmentation")
 
-    # W&B arguments
-    parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
-    parser.add_argument("--wandb_project", type=str, default="yubot-flow-policy", help="W&B project name")
-    parser.add_argument("--wandb_name", type=str, default=None, help="W&B run name")
-    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None, help="W&B tags")
+    # Add preset option
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=list(CONFIGS.keys()),
+        default=None,
+        help="Use a preset configuration (default, fast, debug, full)",
+    )
+
+    # Add all config arguments with defaults
+    TrainingConfig.add_argparse_args(parser)
 
     args = parser.parse_args()
 
-    # Set seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
-    # Create output directory (default to training/checkpoints)
-    if args.output_dir is None:
-        output_dir = TRAINING_DIR / "checkpoints"
+    # Load config: start with preset or default, then apply CLI overrides
+    if args.preset:
+        config = get_preset(args.preset)
+        print(f"Using preset config: {args.preset}")
     else:
-        output_dir = Path(args.output_dir)
+        config = TrainingConfig.from_argparse(args)
+
+    # Print config
+    print("\n" + "=" * 50)
+    print(config)
+    print("=" * 50 + "\n")
+
+    # Set seed
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+
+    # Create output directory
+    output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Check device
-    if args.device == "cuda" and not torch.cuda.is_available():
+    device = config.device
+    if device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU")
-        args.device = "cpu"
+        device = "cpu"
 
-    print(f"Using device: {args.device}")
+    print(f"Using device: {device}")
 
     # Initialize W&B logger
     logger = WandbLogger(
-        enabled=args.wandb,
-        project=args.wandb_project,
-        config=vars(args),
-        run_name=args.wandb_name,
-        tags=args.wandb_tags,
+        enabled=config.wandb,
+        project=config.wandb_project,
+        config=config.to_dict(),
+        run_name=config.wandb_name,
+        tags=config.wandb_tags,
     )
 
     # Create dataloaders
     print("Loading LIBERO demos...")
     train_loader, val_loader = get_libero_dataloaders(
-        libero_dir=args.libero_dir,
-        suites=["libero_spatial", "libero_object"],
-        chunk_size=args.chunk_size,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        temporal_stride=args.temporal_stride,
-        augment=args.augment,
+        libero_dir=config.libero_dir,
+        suites=config.suites,
+        chunk_size=config.chunk_size,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        temporal_stride=config.temporal_stride,
+        augment=config.augment,
     )
 
     # Get proprio_dim from first batch
@@ -228,64 +233,66 @@ def main():
 
     # Create policy
     policy = PickAndPlaceFlowPolicy(
-        action_dim=7,
-        chunk_size=args.chunk_size,
-        hidden_dim=256,
+        action_dim=config.action_dim,
+        chunk_size=config.chunk_size,
+        hidden_dim=config.hidden_dim,
         proprio_dim=proprio_dim,
-        goal_dim=6,
-        pretrained_vision=True,
-    ).to(args.device)
+        goal_dim=config.goal_dim,
+        pretrained_vision=config.pretrained_vision,
+        dropout=config.dropout,
+    ).to(device)
 
     num_params = sum(p.numel() for p in policy.parameters())
     print(f"Policy parameters: {num_params:,}")
 
-    # Watch model with W&B (logs gradients)
-    logger.watch(policy, log="gradients", log_freq=100)
+    # Watch model with W&B (disabled gradient logging for speed)
+    # logger.watch(policy, log="gradients", log_freq=100)
 
     # Optimizer and scheduler
-    optimizer = AdamW(policy.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    optimizer = AdamW(policy.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=1e-6)
 
     # Mixed precision scaler
-    use_amp = not args.no_amp and args.device == "cuda"
+    use_amp = config.use_amp and device == "cuda"
     scaler = GradScaler() if use_amp else None
     if use_amp:
         print("Using mixed precision training (AMP)")
 
     # Frozen encoder setup
     vision_frozen = False
-    if args.freeze_vision_epochs > 0:
+    if config.freeze_vision_epochs > 0:
         freeze_vision_encoder(policy)
         vision_frozen = True
         trainable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-        print(f"Vision encoder frozen for first {args.freeze_vision_epochs} epochs")
+        print(f"Vision encoder frozen for first {config.freeze_vision_epochs} epochs")
         print(f"Trainable parameters: {trainable_params:,} (was {num_params:,})")
 
     # Training loop
     best_val_loss = float("inf")
     global_step = 0
 
-    print(f"\nStarting training for {args.epochs} epochs...")
+    print(f"\nStarting training for {config.epochs} epochs...")
     print(f"Checkpoints: {output_dir}")
 
-    for epoch in range(args.epochs):
+    for epoch in range(config.epochs):
         # Unfreeze vision encoder after N epochs
-        if vision_frozen and epoch >= args.freeze_vision_epochs:
+        if vision_frozen and epoch >= config.freeze_vision_epochs:
             unfreeze_vision_encoder(policy)
             vision_frozen = False
             print(f"Vision encoder unfrozen at epoch {epoch + 1}")
 
-        print(f"\n=== Epoch {epoch + 1}/{args.epochs} ===")
+        print(f"\n=== Epoch {epoch + 1}/{config.epochs} ===")
 
         # Train
         train_loss, global_step = train_epoch(
-            policy, train_loader, optimizer, args.device,
-            logger, epoch + 1, global_step, scaler, use_amp
+            policy, train_loader, optimizer, device,
+            logger, epoch + 1, global_step, scaler, use_amp,
+            log_interval=config.log_interval,
         )
         print(f"Train loss: {train_loss:.4f}")
 
         # Validate
-        val_loss = validate(policy, val_loader, args.device)
+        val_loss = validate(policy, val_loader, device)
         print(f"Val loss: {val_loss:.4f}")
 
         # Step scheduler
@@ -308,7 +315,7 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "train_loss": train_loss,
             "val_loss": val_loss,
-            "args": vars(args),
+            "config": config.to_dict(),
         }
 
         # Save latest
@@ -323,7 +330,7 @@ def main():
             logger.set_summary("best_epoch", epoch + 1)
 
         # Save periodic checkpoint
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % config.save_every == 0:
             torch.save(checkpoint, output_dir / f"pickandplace_epoch{epoch + 1}.pt")
 
     # Finish W&B run
