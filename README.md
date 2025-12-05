@@ -1,6 +1,6 @@
-# Brain-Robot
+# Yubot
 
-Brain-inspired LLM-guided robot control for LIBERO benchmark.
+VLM-guided micro-policy for LIBERO benchmark.
 
 ## Installation
 
