@@ -99,13 +99,42 @@ class MoveSkill(Skill):
         return True, "OK"
     
     def _get_target_position(self, world_state: WorldState, target: str) -> Optional[np.ndarray]:
-        """Get 3D position of target."""
+        """Get 3D position of target from cached world state."""
         if target in world_state.objects:
             return world_state.get_object_position(target)
-        
+
         # Handle special regions (these would need to be defined per-task)
         # For now, return None for unknown regions
         return None
+
+    def _get_fresh_target_position(self, env, world_state: WorldState, target: str) -> Optional[np.ndarray]:
+        """Get FRESH 3D position of target directly from environment.
+
+        This bypasses cached world state to get current object positions,
+        which is important when objects may have moved during prior skills.
+        """
+        # Try to get fresh position from environment's object states
+        if hasattr(env, 'sim') and hasattr(env.sim, 'data'):
+            # Try to find the object body in MuJoCo
+            try:
+                body_id = env.sim.model.body_name2id(target)
+                pos = env.sim.data.body_xpos[body_id].copy()
+                return pos
+            except (KeyError, ValueError):
+                pass
+
+            # Try without _main suffix
+            if target.endswith('_main'):
+                base_name = target[:-5]
+                try:
+                    body_id = env.sim.model.body_name2id(base_name)
+                    pos = env.sim.data.body_xpos[body_id].copy()
+                    return pos
+                except (KeyError, ValueError):
+                    pass
+
+        # Fallback to cached world state
+        return self._get_target_position(world_state, target)
     
     def execute(self, env, world_state: WorldState, args: Dict[str, Any]) -> SkillResult:
         """Execute move: go up, translate, position above target."""
@@ -126,7 +155,9 @@ class MoveSkill(Skill):
                 info={"error_msg": "Failed to get gripper pose", "steps_taken": 0}
             )
 
-        target_pos = self._get_target_position(world_state, target)
+        # Get FRESH target position from environment, not cached world state
+        # This handles cases where objects moved during prior skills
+        target_pos = self._get_fresh_target_position(env, world_state, target)
         if target_pos is None:
             return SkillResult(
                 success=False,

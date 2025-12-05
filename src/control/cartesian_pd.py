@@ -167,21 +167,20 @@ class CartesianPDController:
         ori_error = quat_error(self._target_pose[3:7], current_pose[3:7])
 
         # Compute velocity (D term) - approximate from pose difference
+        # Scale by assumed dt (~0.02s at 50Hz) to get proper velocity units
         if self._prev_pose is not None:
-            pos_velocity = current_pose[:3] - self._prev_pose[:3]
-            ori_velocity = current_pose[3:7] - self._prev_pose[3:7]
-            # Use magnitude of quaternion change as angular velocity proxy
-            ori_vel_magnitude = np.linalg.norm(ori_velocity[:3])  # xyz components
+            pos_velocity = (current_pose[:3] - self._prev_pose[:3]) / 0.02
+            ori_velocity = quat_error(current_pose[3:7], self._prev_pose[3:7]) / 0.02
         else:
             pos_velocity = np.zeros(3)
-            ori_vel_magnitude = 0.0
+            ori_velocity = np.zeros(3)
 
         # Store current pose for next iteration
         self._prev_pose = current_pose.copy()
 
         # PD control: action = Kp * error - Kd * velocity
         pos_action = self.kp_pos * pos_error - self.kd_pos * pos_velocity
-        ori_action = self.kp_ori * ori_error - self.kd_ori * ori_vel_magnitude * np.sign(ori_error)
+        ori_action = self.kp_ori * ori_error - self.kd_ori * ori_velocity
 
         # Combine and clip
         action = np.concatenate([pos_action, ori_action, [self._gripper_target]])
