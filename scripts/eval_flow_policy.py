@@ -28,6 +28,126 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from src.policy.flow_policy import PickAndPlaceFlowPolicy
+from src.grounding.semantic_grounder import QwenSemanticGrounder
+from src.grounding.enriched_object import EnrichedObject, parse_object_description
+from typing import List
+
+
+# Goal dimension: pick_pos(3) + place_pos(3)
+GOAL_DIM = 6
+
+
+def build_objects_from_obs(obs: dict) -> List[EnrichedObject]:
+    """Build EnrichedObject list from observation keys.
+
+    Extracts object IDs from observation dict keys ending in '_pos'.
+    Uses parse_object_description to get human-readable descriptions.
+    """
+    objects = []
+    seen_ids = set()
+
+    for key in obs.keys():
+        if key.endswith("_pos") and not key.startswith("robot"):
+            obj_id = key[:-4]  # Remove "_pos"
+            if obj_id in seen_ids:
+                continue
+            seen_ids.add(obj_id)
+
+            # Get human-readable description
+            description = parse_object_description(obj_id)
+
+            # Extract type from description (first noun)
+            parts = description.split()
+            obj_type = parts[-1] if parts else obj_id
+
+            # Get position
+            pos = obs[key]
+
+            objects.append(EnrichedObject(
+                id=obj_id,
+                description=description,
+                type=obj_type,
+                position=tuple(pos),
+            ))
+
+    return objects
+
+
+def find_object_position(obs: dict, object_name: str) -> np.ndarray:
+    """Find object position from observation dict.
+
+    LIBERO observations contain object positions with keys like:
+    - 'alphabet_soup_pos', 'plate_pos', etc.
+    """
+    # Direct match
+    key = f"{object_name}_pos"
+    if key in obs:
+        return obs[key].copy()
+
+    # Try with common prefixes/suffixes
+    for obs_key in obs.keys():
+        if object_name in obs_key.lower() and obs_key.endswith("_pos"):
+            return obs[obs_key].copy()
+
+    # Fallback: search for partial match
+    object_words = object_name.replace("_", " ").split()
+    for obs_key in obs.keys():
+        if obs_key.endswith("_pos"):
+            key_lower = obs_key.lower()
+            if all(word in key_lower for word in object_words):
+                return obs[obs_key].copy()
+
+    # Return current EE position as fallback
+    if "robot0_eef_pos" in obs:
+        return obs["robot0_eef_pos"].copy()
+
+    return np.array([0.0, 0.0, 0.9])
+
+
+def extract_goal_6d(
+    obs: dict,
+    task_description: str,
+    grounder: QwenSemanticGrounder,
+) -> tuple:
+    """Extract 6-dim goal from observation and task description using VLM grounding.
+
+    Goal format:
+        - pick_pos (3): Position of object to pick
+        - place_pos (3): Position of place target
+
+    Args:
+        obs: LIBERO observation dict containing object positions
+        task_description: Natural language task description
+        grounder: VLM grounder for semantic grounding
+
+    Returns:
+        (goal, pick_obj_name, place_target_name) tuple
+    """
+    # Use VLM grounding
+    objects = build_objects_from_obs(obs)
+    result = grounder.ground(task_description, objects)
+
+    if not result.valid:
+        raise ValueError(f"VLM grounding failed: {result.error}")
+
+    pick_obj_name = result.source_object
+    place_target_name = result.target_location
+    print(f"  VLM grounding: pick={pick_obj_name}, place={place_target_name}")
+
+    # Get positions from observations
+    pick_pos = find_object_position(obs, pick_obj_name)
+    place_pos = find_object_position(obs, place_target_name)
+
+    # Add height offset for placement (place slightly above target)
+    place_pos[2] += 0.05
+
+    # Concatenate into 6-dim goal
+    goal = np.concatenate([
+        pick_pos,   # (3,) where to pick
+        place_pos,  # (3,) where to place
+    ])
+
+    return goal, pick_obj_name, place_target_name
 
 
 def add_debug_overlay(
@@ -42,7 +162,7 @@ def add_debug_overlay(
     task_description: str = "",
     success: bool = False,
 ) -> np.ndarray:
-    """Add debug information overlay to frame with side panel (similar to debug_video.py style)."""
+    """Add debug information overlay to frame with side panel."""
     if not HAS_CV2:
         return frame
 
@@ -56,17 +176,17 @@ def add_debug_overlay(
     # Convert RGB to BGR for OpenCV
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-    # Create overlay panel on the right (like debug_video.py)
-    panel_width = 350
+    # Create overlay panel on the right
+    panel_width = 380
     panel = np.zeros((frame.shape[0], panel_width, 3), dtype=np.uint8)
     panel[:] = (30, 30, 30)  # Dark gray background
 
     # Text settings
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.45
+    font_scale = 0.42
     color = (255, 255, 255)
-    line_height = 20
-    y_offset = 25
+    line_height = 18
+    y_offset = 20
 
     # Task description
     if task_description:
@@ -77,7 +197,7 @@ def add_debug_overlay(
         line = ""
         for word in words:
             test_line = line + " " + word if line else word
-            if len(test_line) * 8 < panel_width - 20:
+            if len(test_line) * 7 < panel_width - 20:
                 line = test_line
             else:
                 cv2.putText(panel, line, (10, y_offset), font, font_scale * 0.9, color, 1)
@@ -94,7 +214,7 @@ def add_debug_overlay(
     cv2.putText(panel, f"  Step: {step}", (10, y_offset), font, font_scale * 0.9, color, 1)
     y_offset += line_height
     cv2.putText(panel, f"  Chunk: {chunk_idx + 1}/{chunk_size}", (10, y_offset), font, font_scale * 0.9, color, 1)
-    y_offset += line_height + 5
+    y_offset += line_height + 3
 
     # Action info
     cv2.putText(panel, "ACTION (OSC):", (10, y_offset), font, font_scale, (100, 200, 100), 1)
@@ -112,26 +232,41 @@ def add_debug_overlay(
     y_offset += line_height
     cv2.putText(panel, f"  Gripper: {gripper_str} ({gripper:+.2f})",
                 (10, y_offset), font, font_scale * 0.85, (200, 200, 100), 1)
-    y_offset += line_height + 5
+    y_offset += line_height + 3
 
     # Robot state
     cv2.putText(panel, "ROBOT STATE:", (10, y_offset), font, font_scale, (100, 200, 100), 1)
     y_offset += line_height
     cv2.putText(panel, f"  EE Pos: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]",
                 (10, y_offset), font, font_scale * 0.85, (100, 200, 200), 1)
-    y_offset += line_height + 5
+    y_offset += line_height + 3
 
-    # Goal info
-    cv2.putText(panel, "GOAL:", (10, y_offset), font, font_scale, (100, 200, 100), 1)
+    # Goal info (6-dim: pick_pos + place_pos)
+    cv2.putText(panel, "GOAL (6-dim):", (10, y_offset), font, font_scale, (100, 200, 100), 1)
     y_offset += line_height
-    cv2.putText(panel, f"  Target: [{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}]",
+
+    pick_pos = goal[:3]
+    place_pos = goal[3:6]
+
+    # Pick target
+    cv2.putText(panel, f"  Pick:  [{pick_pos[0]:.3f}, {pick_pos[1]:.3f}, {pick_pos[2]:.3f}]",
                 (10, y_offset), font, font_scale * 0.85, (255, 150, 100), 1)
     y_offset += line_height
-    dist = np.linalg.norm(ee_pos - goal)
-    dist_color = (100, 255, 100) if dist < 0.05 else (100, 200, 200)
-    cv2.putText(panel, f"  Distance: {dist:.3f}m",
-                (10, y_offset), font, font_scale * 0.85, dist_color, 1)
-    y_offset += line_height + 5
+    dist_pick = np.linalg.norm(ee_pos - pick_pos)
+    dist_color = (100, 255, 100) if dist_pick < 0.05 else (200, 200, 200)
+    cv2.putText(panel, f"    dist: {dist_pick:.3f}m",
+                (10, y_offset), font, font_scale * 0.8, dist_color, 1)
+    y_offset += line_height
+
+    # Place target
+    cv2.putText(panel, f"  Place: [{place_pos[0]:.3f}, {place_pos[1]:.3f}, {place_pos[2]:.3f}]",
+                (10, y_offset), font, font_scale * 0.85, (100, 150, 255), 1)
+    y_offset += line_height
+    dist_place = np.linalg.norm(ee_pos - place_pos)
+    dist_color = (100, 255, 100) if dist_place < 0.05 else (200, 200, 200)
+    cv2.putText(panel, f"    dist: {dist_place:.3f}m",
+                (10, y_offset), font, font_scale * 0.8, dist_color, 1)
+    y_offset += line_height + 3
 
     # Cumulative reward
     cv2.putText(panel, f"Cumulative Reward: {reward:.2f}",
@@ -211,44 +346,6 @@ def get_obs_tensors(obs: dict, device: str):
     return image.to(device), proprio.to(device)
 
 
-def extract_goal_from_obs(obs: dict, task_description: str) -> np.ndarray:
-    """Extract goal position from observation dict.
-
-    For pick-and-place tasks, the goal is typically the target container position.
-    LIBERO obs dict contains object positions directly.
-    """
-    task_lower = task_description.lower()
-
-    # Common target objects in LIBERO - look for these in obs keys
-    target_keywords = ['plate', 'tray', 'basket', 'container', 'bin']
-
-    # Check which target keyword is mentioned in task
-    target_type = None
-    for keyword in target_keywords:
-        if keyword in task_lower:
-            target_type = keyword
-            break
-
-    # Search obs keys for matching object position
-    if target_type:
-        for key in obs.keys():
-            if target_type in key.lower() and key.endswith('_pos'):
-                pos = obs[key].copy()
-                # Offset slightly above the container for placing
-                pos[2] += 0.08
-                return pos
-
-    # Fallback: look for any plate position
-    for key in obs.keys():
-        if 'plate' in key.lower() and key.endswith('_pos'):
-            pos = obs[key].copy()
-            pos[2] += 0.08
-            return pos
-
-    # Last fallback: use a default position
-    return np.array([0.0, 0.0, 0.95])
-
-
 def run_episode(
     env,
     policy: PickAndPlaceFlowPolicy,
@@ -265,7 +362,7 @@ def run_episode(
     Args:
         env: LIBERO environment
         policy: Flow matching policy
-        goal: (3,) target position
+        goal: (6,) goal vector [pick_pos, place_pos]
         device: torch device
         max_steps: Maximum environment steps
         action_repeat: How many times to repeat each action
@@ -277,7 +374,7 @@ def run_episode(
     """
     obs = env.reset()
 
-    goal_tensor = torch.from_numpy(goal).float().unsqueeze(0).to(device)  # (1, 3)
+    goal_tensor = torch.from_numpy(goal).float().unsqueeze(0).to(device)  # (1, 6)
 
     total_reward = 0.0
     success = False
@@ -383,13 +480,13 @@ def run_single_task(task_args: dict) -> dict:
     ckpt_args = checkpoint_data.get("args", {})
     chunk_size = ckpt_args.get("chunk_size", 16)
 
-    # Create policy
+    # Create policy with 6-dim goal
     policy = PickAndPlaceFlowPolicy(
         action_dim=7,
         chunk_size=chunk_size,
         hidden_dim=256,
         proprio_dim=8,
-        goal_dim=3,
+        goal_dim=GOAL_DIM,  # 6-dim goal (pick_pos + place_pos)
         pretrained_vision=False,
     ).to(device)
 
@@ -401,9 +498,18 @@ def run_single_task(task_args: dict) -> dict:
     env, task_description = make_libero_env(task_suite, task_id)
     print(f"[Task {task_id}] Task: {task_description}")
 
-    # Get initial obs to extract goal
+    # Initialize VLM grounder
+    print(f"[Task {task_id}] Loading VLM grounder...")
+    grounder = QwenSemanticGrounder()
+    grounder.load_model()
+
+    # Get initial obs to extract 6-dim goal
     init_obs = env.reset()
-    goal = extract_goal_from_obs(init_obs, task_description)
+    goal, pick_obj, place_target = extract_goal_6d(init_obs, task_description, grounder)
+
+    # Log goal extraction
+    print(f"[Task {task_id}] Pick object: {pick_obj}, Place target: {place_target}")
+    print(f"[Task {task_id}] Goal - Pick pos: {goal[:3]}, Place pos: {goal[3:6]}")
 
     # Create output directory
     output_path = Path(output_dir)
@@ -460,6 +566,12 @@ def run_single_task(task_args: dict) -> dict:
         "checkpoint": checkpoint,
         "num_episodes": num_episodes,
         "success_rate": success_rate,
+        "goal": {
+            "pick_object": pick_obj,
+            "place_target": place_target,
+            "pick_pos": goal[:3].tolist(),
+            "place_pos": goal[3:6].tolist(),
+        },
         "results": results,
         "args": task_args,
     }
@@ -548,7 +660,6 @@ def main():
         default=42,
         help="Random seed",
     )
-
     args = parser.parse_args()
 
     # Determine task IDs to run
