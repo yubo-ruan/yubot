@@ -3,7 +3,8 @@
 Loads HDF5 demonstration files from LIBERO-Spatial and LIBERO-Object
 benchmarks for behavior cloning with flow matching.
 
-Uses oracle object positions from replaying demo states in the environment.
+Uses oracle object positions extracted from demonstration trajectories.
+Goal format: 12-dim = [pick_pos(3), pick_approach(3), place_pos(3), place_approach(3)]
 """
 
 import os
@@ -14,15 +15,41 @@ from typing import Dict, List, Optional, Tuple
 import h5py
 import numpy as np
 import torch
+import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader
 
-# LIBERO environment imports (optional - used for oracle goal extraction)
-try:
-    from libero.libero.envs.env_wrapper import OffScreenRenderEnv
-    LIBERO_AVAILABLE = True
-except ImportError:
-    LIBERO_AVAILABLE = False
-    print("Warning: LIBERO environment not available. Using fallback goal extraction.")
+
+# Goal dimension: pick_pos(3) + place_pos(3)
+GOAL_DIM = 6
+
+
+def find_gripper_events(gripper: np.ndarray) -> Tuple[int, int]:
+    """Find grasp (close) and release (open) timestamps from gripper states.
+
+    Args:
+        gripper: (T, 2) gripper finger positions
+
+    Returns:
+        (grasp_t, release_t) timestamps
+    """
+    gripper_width = gripper.sum(axis=1)
+    T = len(gripper_width)
+
+    # Find first significant closing (grasp)
+    grasp_t = 0
+    for t in range(1, T):
+        if gripper_width[t] < gripper_width[t - 1] - 0.01:
+            grasp_t = t
+            break
+
+    # Find last significant opening (release) after grasp
+    release_t = T - 1
+    for t in range(T - 1, grasp_t, -1):
+        if gripper_width[t] > gripper_width[t - 1] + 0.01:
+            release_t = t
+            break
+
+    return grasp_t, release_t
 
 
 class LIBERODataset(Dataset):
@@ -31,13 +58,15 @@ class LIBERODataset(Dataset):
     Loads action chunks from HDF5 demonstration files and pairs them
     with observations (images, proprioception, goal).
 
+    Goal format (6-dim):
+        - pick_pos (3): Position where object was grasped
+        - place_pos (3): Position where object was released
+
     Args:
         demo_paths: List of paths to HDF5 demo files
         chunk_size: Length of action chunks to sample
         img_size: Size to resize images to (H, W)
         camera_name: Which camera to use ('agentview_rgb' or 'eye_in_hand_rgb')
-        bddl_dir: Directory containing BDDL files for oracle goal extraction
-        use_oracle_goals: Whether to use oracle object positions as goals
         place_height_offset: Height offset to add to place target position
     """
 
@@ -47,19 +76,25 @@ class LIBERODataset(Dataset):
         chunk_size: int = 16,
         img_size: Tuple[int, int] = (128, 128),
         camera_name: str = "agentview_rgb",
-        bddl_dir: Optional[str] = None,
-        use_oracle_goals: bool = True,
-        place_height_offset: float = 0.05,
+        place_height_offset: float = 0.02,
+        temporal_stride: int = 1,
+        augment: bool = False,
     ):
         self.chunk_size = chunk_size
         self.img_size = img_size
         self.camera_name = camera_name
-        self.bddl_dir = bddl_dir
-        self.use_oracle_goals = use_oracle_goals and LIBERO_AVAILABLE
         self.place_height_offset = place_height_offset
+        self.temporal_stride = temporal_stride
+        self.augment = augment
 
-        if use_oracle_goals and not LIBERO_AVAILABLE:
-            print("Warning: Oracle goals requested but LIBERO not available. Using fallback.")
+        # Data augmentation transforms (applied to normalized [0,1] images)
+        if augment:
+            self.transform = T.Compose([
+                T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
+                T.RandomAffine(degrees=3, translate=(0.03, 0.03), scale=(0.97, 1.03)),
+            ])
+        else:
+            self.transform = None
 
         # Load all demos into memory
         self.samples = []
@@ -67,18 +102,10 @@ class LIBERODataset(Dataset):
 
     def _load_demos(self, demo_paths: List[str]):
         """Load all demonstrations from HDF5 files."""
-        # Cache for oracle goal extraction environments
-        env_cache = {}
-
         for path in demo_paths:
             if not os.path.exists(path):
                 print(f"Warning: {path} not found, skipping")
                 continue
-
-            # Get oracle goals for this file if using oracle mode
-            oracle_goals = None
-            if self.use_oracle_goals and self.bddl_dir:
-                oracle_goals = self._get_oracle_goals_for_file(path, env_cache)
 
             with h5py.File(path, "r") as f:
                 data_grp = f["data"]
@@ -89,17 +116,7 @@ class LIBERODataset(Dataset):
                         continue
 
                     demo = data_grp[demo_key]
-                    # Get oracle goal for this specific demo
-                    demo_idx = int(demo_key.split("_")[1])
-                    oracle_goal = oracle_goals.get(demo_idx) if oracle_goals else None
-                    self._process_demo(demo, path, oracle_goal=oracle_goal)
-
-        # Close any cached environments
-        for env in env_cache.values():
-            try:
-                env.close()
-            except:
-                pass
+                    self._process_demo(demo, path)
 
     def _process_demo(self, demo: h5py.Group, path: str):
         """Extract samples from a single demonstration."""
@@ -126,54 +143,57 @@ class LIBERODataset(Dataset):
 
         T = len(images)
 
-        # Get goal (final object position - use last frame's ee position as proxy)
-        # In practice, we'd extract object position from task description
-        # For now, use final gripper position when gripper first closes
-        goal = self._extract_goal(ee_pos, gripper)
+        # Extract 6-dim goal from trajectory
+        goal = self._extract_goal_6d(ee_pos, gripper)
 
-        # Sample action chunks
+        # Sample action chunks with temporal stride
         # We can start a chunk at any timestep where there's enough future steps
-        for t in range(T - self.chunk_size):
+        for t in range(0, T - self.chunk_size, self.temporal_stride):
             sample = {
                 "image": images[t],                          # (H, W, C)
                 "ee_pos": ee_pos[t],                         # (3,)
                 "ee_ori": ee_ori[t],                         # (3,) or (4,)
                 "gripper": gripper[t],                       # (2,)
-                "goal": goal,                                # (3,)
+                "goal": goal,                                # (6,)
                 "actions": actions[t:t + self.chunk_size],   # (chunk_size, 7)
             }
             self.samples.append(sample)
 
-    def _extract_goal(
+    def _extract_goal_6d(
         self,
         ee_pos: np.ndarray,
         gripper: np.ndarray,
     ) -> np.ndarray:
-        """Extract goal position from trajectory.
+        """Extract 6-dim goal from trajectory.
 
-        For pick-and-place, the goal is where the object ends up.
-        We approximate this as the gripper position at the last frame
-        before gripper opens for release.
+        The goal encodes pick and place positions:
+        - pick_pos: EE position at grasp moment (where object is)
+        - place_pos: EE position at release moment (where object goes)
 
         Args:
             ee_pos: (T, 3) end-effector positions
             gripper: (T, 2) gripper states
 
         Returns:
-            (3,) goal position
+            (6,) goal vector
         """
-        # Find when gripper opens at the end (release point)
-        gripper_width = gripper.sum(axis=1)
-        T = len(gripper_width)
+        # Find grasp and release events
+        grasp_t, release_t = find_gripper_events(gripper)
 
-        # Look for last closing→opening transition
-        for t in range(T - 1, 0, -1):
-            if gripper_width[t] > gripper_width[t - 1] + 0.01:
-                # Found opening - goal is position just before
-                return ee_pos[t - 1].copy()
+        # Get positions at grasp and release
+        pick_pos = ee_pos[grasp_t].copy()
+        place_pos = ee_pos[release_t].copy()
 
-        # Fallback: use final position
-        return ee_pos[-1].copy()
+        # Add small height offset to place position (object settles slightly lower)
+        place_pos[2] += self.place_height_offset
+
+        # Concatenate into 6-dim goal
+        goal = np.concatenate([
+            pick_pos,   # (3,) where to pick
+            place_pos,  # (3,) where to place
+        ])
+
+        return goal
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -185,6 +205,10 @@ class LIBERODataset(Dataset):
         image = torch.from_numpy(sample["image"]).float()
         image = image.permute(2, 0, 1) / 255.0  # (C, H, W)
 
+        # Apply augmentation if enabled
+        if self.transform is not None:
+            image = self.transform(image)
+
         # Proprioception
         ee_pos = torch.from_numpy(sample["ee_pos"]).float()
         ee_ori = torch.from_numpy(sample["ee_ori"]).float()
@@ -193,7 +217,7 @@ class LIBERODataset(Dataset):
         # Concat proprioception
         proprio = torch.cat([ee_pos, ee_ori, gripper], dim=-1)
 
-        # Goal
+        # Goal (6-dim)
         goal = torch.from_numpy(sample["goal"]).float()
 
         # Actions
@@ -202,7 +226,7 @@ class LIBERODataset(Dataset):
         return {
             "image": image,      # (C, H, W)
             "proprio": proprio,  # (proprio_dim,)
-            "goal": goal,        # (3,)
+            "goal": goal,        # (6,)
             "actions": actions,  # (chunk_size, 7)
         }
 
@@ -244,6 +268,8 @@ def get_libero_dataloaders(
     batch_size: int = 32,
     val_split: float = 0.1,
     num_workers: int = 4,
+    temporal_stride: int = 1,
+    augment: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation dataloaders for LIBERO demos.
 
@@ -254,6 +280,8 @@ def get_libero_dataloaders(
         batch_size: Batch size for training
         val_split: Fraction of data for validation
         num_workers: Number of dataloader workers
+        temporal_stride: Sample every Nth timestep (reduces sample count, increases diversity)
+        augment: Whether to apply data augmentation to training images
 
     Returns:
         (train_loader, val_loader) tuple
@@ -272,9 +300,13 @@ def get_libero_dataloaders(
 
     print(f"Train: {len(train_paths)} files, Val: {len(val_paths)} files")
 
-    # Create datasets
-    train_dataset = LIBERODataset(train_paths, chunk_size=chunk_size)
-    val_dataset = LIBERODataset(val_paths, chunk_size=chunk_size)
+    # Create datasets (augmentation only for training)
+    train_dataset = LIBERODataset(
+        train_paths, chunk_size=chunk_size, temporal_stride=temporal_stride, augment=augment
+    )
+    val_dataset = LIBERODataset(
+        val_paths, chunk_size=chunk_size, temporal_stride=temporal_stride, augment=False
+    )
 
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 

@@ -76,7 +76,7 @@ class PickAndPlaceFlowPolicy(nn.Module):
         chunk_size: int = 16,
         hidden_dim: int = 256,
         proprio_dim: int = 8,   # ee_pos(3) + ee_ori(3) + gripper(2)
-        goal_dim: int = 3,      # target xyz position
+        goal_dim: int = 6,      # pick_pos(3) + place_pos(3)
         pretrained_vision: bool = True,
     ):
         super().__init__()
