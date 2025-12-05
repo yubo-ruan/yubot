@@ -17,7 +17,3 @@ python scripts/download_models.py
 ```
 
 > **Note**: Model weights are not included in the repo. Run the download script after cloning.
-
-## License
-
-MIT License
