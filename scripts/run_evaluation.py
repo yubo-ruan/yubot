@@ -156,7 +156,7 @@ def run_episode_hardcoded(
 
         skill_timer_name = f"skill_{skill.name}"
         with logger.get_timer().measure(skill_timer_name):
-            result = skill.run(env, world_state, args)
+            result = skill.run(env, world_state, args, logger=logger)
 
         logger.log_skill(skill.name, args, result)
         logger.log_world_state(world_state)
@@ -165,12 +165,18 @@ def run_episode_hardcoded(
 
         if not result.success:
             print(f"  {skill.name} failed: {result.info.get('error_msg', 'Unknown')}")
-            return False
+            return False, "Skill execution failed"
 
         print(f"  {skill.name}: OK ({result.info.get('steps_taken', 0)} steps)")
 
     print(f"  Total steps: {step_count}")
-    return True
+
+    # Check LIBERO's actual task success condition
+    task_success = env.check_success() if hasattr(env, 'check_success') else env._check_success()
+    if not task_success:
+        return False, "Task not completed (LIBERO check failed)"
+
+    return True, None
 
 
 def run_episode_qwen(
@@ -183,8 +189,12 @@ def run_episode_qwen(
     planner,
     metrics,
     task_id: str,
-) -> bool:
-    """Run episode with Qwen skill planning (Phase 2)."""
+) -> tuple:
+    """Run episode with Qwen skill planning (Phase 2).
+
+    Returns:
+        Tuple of (success: bool, failure_reason: str or None)
+    """
     from src.planning.prompts import prepare_world_state_for_qwen
 
     # Get initial perception
@@ -193,7 +203,7 @@ def run_episode_qwen(
     logger.log_world_state(world_state)
 
     if len(perc_result.object_names) < 2:
-        return False
+        return False, "Not enough objects detected"
 
     # Plan with Qwen
     print("  Planning with Qwen...")
@@ -206,7 +216,7 @@ def run_episode_qwen(
 
     if not plan_result.success:
         print(f"  Planning failed: {plan_result.error}")
-        return False
+        return False, f"Planning failed: {plan_result.error}"
 
     print(f"  Plan generated: {len(plan_result.plan)} steps")
     for i, step in enumerate(plan_result.plan):
@@ -228,14 +238,21 @@ def run_episode_qwen(
         perception=perception,
     )
 
-    if success:
-        metrics.record_goal_reached(task_id)
-        print(f"  Total steps: {exec_info.get('steps_taken', 0)}")
-    else:
+    if not success:
         metrics.record_goal_not_reached(task_id, plan_result.plan, exec_info.get("error", "Unknown"))
         print(f"  Execution failed at step {exec_info.get('failed_step', '?')}: {exec_info.get('error', 'Unknown')}")
+        return False, f"Skill execution failed: {exec_info.get('error', 'Unknown')}"
 
-    return success
+    print(f"  Total steps: {exec_info.get('steps_taken', 0)}")
+
+    # Check LIBERO's actual task success condition
+    task_success = env.check_success() if hasattr(env, 'check_success') else env._check_success()
+    if not task_success:
+        metrics.record_goal_not_reached(task_id, plan_result.plan, "LIBERO task check failed")
+        return False, "Task not completed (LIBERO check failed)"
+
+    metrics.record_goal_reached(task_id)
+    return True, None
 
 
 def run_episode_qwen_grounded(
@@ -248,11 +265,14 @@ def run_episode_qwen_grounded(
     grounder,
     grounding_metrics,
     task_id: str,
-) -> bool:
+) -> tuple:
     """Run episode with Qwen semantic grounding + hardcoded skill sequence (Phase 3).
 
     This mode uses Qwen to ground the task language to object IDs,
     then executes a deterministic skill sequence.
+
+    Returns:
+        Tuple of (success: bool, failure_reason: str or None)
     """
     from src.grounding.enriched_object import enrich_objects
 
@@ -262,7 +282,7 @@ def run_episode_qwen_grounded(
     logger.log_world_state(world_state)
 
     if len(perc_result.object_names) < 2:
-        return False
+        return False, "Not enough objects detected"
 
     # Enrich objects with human-readable descriptions
     enriched = enrich_objects(world_state)
@@ -278,7 +298,7 @@ def run_episode_qwen_grounded(
 
     if not grounding_result.valid:
         print(f"  Grounding failed: {grounding_result.error}")
-        return False
+        return False, f"Grounding failed: {grounding_result.error}"
 
     source_obj = grounding_result.source_object
     target_obj = grounding_result.target_location
@@ -310,7 +330,7 @@ def run_episode_qwen_grounded(
 
         skill_timer_name = f"skill_{skill.name}"
         with logger.get_timer().measure(skill_timer_name):
-            result = skill.run(env, world_state, args)
+            result = skill.run(env, world_state, args, logger=logger)
 
         logger.log_skill(skill.name, args, result)
         logger.log_world_state(world_state)
@@ -319,12 +339,18 @@ def run_episode_qwen_grounded(
 
         if not result.success:
             print(f"  {skill.name} failed: {result.info.get('error_msg', 'Unknown')}")
-            return False
+            return False, f"Skill execution failed: {result.info.get('error_msg', 'Unknown')}"
 
         print(f"  {skill.name}: OK ({result.info.get('steps_taken', 0)} steps)")
 
     print(f"  Total steps: {step_count}")
-    return True
+
+    # Check LIBERO's actual task success condition
+    task_success = env.check_success() if hasattr(env, 'check_success') else env._check_success()
+    if not task_success:
+        return False, "Task not completed (LIBERO check failed)"
+
+    return True, None
 
 
 def main():
@@ -335,7 +361,9 @@ def main():
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--n-episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-dir", type=str, default="logs/evaluation")
+    # Default output dir is relative to the repo root (parent of scripts/)
+    repo_root = Path(__file__).parent.parent
+    parser.add_argument("--output-dir", type=str, default=str(repo_root / "logs" / "evaluation"))
     args = parser.parse_args()
 
     # Create config
@@ -422,7 +450,7 @@ def main():
 
         try:
             if args.mode == "hardcoded":
-                success = run_episode_hardcoded(
+                success, failure_reason = run_episode_hardcoded(
                     env=env,
                     task_description=task_description,
                     world_state=world_state,
@@ -431,7 +459,7 @@ def main():
                     logger=logger,
                 )
             elif args.mode == "qwen":
-                success = run_episode_qwen(
+                success, failure_reason = run_episode_qwen(
                     env=env,
                     task_description=task_description,
                     world_state=world_state,
@@ -443,7 +471,7 @@ def main():
                     task_id=task_id_str,
                 )
             elif args.mode == "qwen_grounded":
-                success = run_episode_qwen_grounded(
+                success, failure_reason = run_episode_qwen_grounded(
                     env=env,
                     task_description=task_description,
                     world_state=world_state,
@@ -459,10 +487,11 @@ def main():
             import traceback
             traceback.print_exc()
             success = False
+            failure_reason = str(e)
 
         logger.end_episode(
             success=success,
-            failure_reason=None if success else "Execution failed",
+            failure_reason=failure_reason,
         )
 
         if success:

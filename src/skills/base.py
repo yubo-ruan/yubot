@@ -119,16 +119,17 @@ class Skill(ABC):
         """
         pass
     
-    def run(self, env, world_state: WorldState, args: Dict[str, Any]) -> SkillResult:
+    def run(self, env, world_state: WorldState, args: Dict[str, Any], logger=None) -> SkillResult:
         """Full skill execution with pre/post checks.
-        
+
         This is the main entry point for skill execution.
-        
+
         Args:
             env: The robosuite/LIBERO environment.
             world_state: Current world state.
             args: Skill arguments.
-            
+            logger: Optional EpisodeLogger for frame capture.
+
         Returns:
             SkillResult with full execution info.
         """
@@ -143,14 +144,20 @@ class Skill(ABC):
                     "precondition_failed": True,
                 }
             )
-        
+
+        # Store logger for use in _step_env
+        self._logger = logger
+
         # Execute skill
         result = self.execute(env, world_state, args)
-        
+
+        # Clear logger reference
+        self._logger = None
+
         # Update world state if successful
         if result.success:
             self.update_world_state(world_state, args, result)
-        
+
         return result
     
     def _get_gripper_pose_from_obs(self, obs: dict) -> Optional[np.ndarray]:
@@ -200,7 +207,18 @@ class Skill(ABC):
     def _step_env(self, env, action: np.ndarray):
         """Helper to step environment with action.
 
+        Args:
+            env: The environment.
+            action: Action array.
+
         Returns:
             Tuple of (obs, reward, done, info).
         """
-        return env.step(action)
+        result = env.step(action)
+        obs = result[0] if len(result) >= 1 else {}
+
+        # Capture frame for video recording if logger is set
+        if hasattr(self, '_logger') and self._logger is not None and 'agentview_image' in obs:
+            self._logger.log_frame(obs['agentview_image'])
+
+        return result

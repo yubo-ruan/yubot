@@ -265,10 +265,10 @@ class QwenSkillPlanner:
                     metrics.record_execution_failure(task_id, plan, i, error)
                 return False, {"error": error, "failed_step": i}
 
-            # Execute skill
-            result = skill.run(env, world_state, args)
+            # Execute skill (pass logger for video recording)
+            result = skill.run(env, world_state, args, logger=logger)
 
-            # Log if available
+            # Log skill result if available
             if logger:
                 logger.log_skill(skill_name, args, result)
 

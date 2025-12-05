@@ -8,7 +8,7 @@ import numpy as np
 
 from .base import Skill, SkillResult
 from ..world_model.state import WorldState
-from ..control.cartesian_pd import CartesianPDController
+from ..control import CartesianPDController
 from ..config import SkillConfig
 
 

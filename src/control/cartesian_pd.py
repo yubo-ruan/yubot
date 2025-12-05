@@ -90,30 +90,40 @@ def pd_control(
 
 class CartesianPDController:
     """Cartesian PD controller with configurable gains.
-    
+
     Provides pose tracking with position and orientation control.
+    Uses actual derivative term for smooth, damped motion.
     """
-    
+
     def __init__(
         self,
         kp_pos: float = 5.0,
         kp_ori: float = 2.0,
+        kd_pos: float = 0.5,
+        kd_ori: float = 0.1,
         max_action: float = 1.0,
     ):
         """Initialize controller.
-        
+
         Args:
             kp_pos: Position proportional gain.
             kp_ori: Orientation proportional gain.
+            kd_pos: Position derivative gain (damping).
+            kd_ori: Orientation derivative gain (damping).
             max_action: Maximum action magnitude.
         """
         self.kp_pos = kp_pos
         self.kp_ori = kp_ori
+        self.kd_pos = kd_pos
+        self.kd_ori = kd_ori
         self.max_action = max_action
-        
+
         # Target state
         self._target_pose: Optional[np.ndarray] = None
         self._gripper_target: float = 0.0
+
+        # Previous state for derivative computation
+        self._prev_pose: Optional[np.ndarray] = None
     
     @classmethod
     def from_config(cls, config: SkillConfig) -> "CartesianPDController":
@@ -121,39 +131,64 @@ class CartesianPDController:
         return cls(
             kp_pos=config.kp_pos,
             kp_ori=config.kp_ori,
+            kd_pos=getattr(config, 'kd_pos', 2.0),
+            kd_ori=getattr(config, 'kd_ori', 0.5),
             max_action=config.max_action_magnitude,
         )
     
     def set_target(self, target_pose: np.ndarray, gripper: float = 0.0):
         """Set target pose for controller.
-        
+
         Args:
             target_pose: 7D target pose [x, y, z, qw, qx, qy, qz].
             gripper: Gripper target (-1 = close, 1 = open).
         """
         self._target_pose = target_pose.copy()
         self._gripper_target = gripper
+        # Reset derivative state when target changes
+        self._prev_pose = None
     
     def compute_action(self, current_pose: np.ndarray) -> np.ndarray:
-        """Compute control action.
-        
+        """Compute control action with PD control.
+
         Args:
             current_pose: Current 7D pose.
-            
+
         Returns:
             Action vector [dx, dy, dz, drx, dry, drz, gripper].
         """
         if self._target_pose is None:
             return np.zeros(7)
-        
-        return pd_control(
-            current_pose=current_pose,
-            target_pose=self._target_pose,
-            kp_pos=self.kp_pos,
-            kp_ori=self.kp_ori,
-            gripper=self._gripper_target,
-            max_action=self.max_action,
-        )
+
+        # Position error (P term)
+        pos_error = self._target_pose[:3] - current_pose[:3]
+
+        # Orientation error (P term)
+        ori_error = quat_error(self._target_pose[3:7], current_pose[3:7])
+
+        # Compute velocity (D term) - approximate from pose difference
+        if self._prev_pose is not None:
+            pos_velocity = current_pose[:3] - self._prev_pose[:3]
+            ori_velocity = current_pose[3:7] - self._prev_pose[3:7]
+            # Use magnitude of quaternion change as angular velocity proxy
+            ori_vel_magnitude = np.linalg.norm(ori_velocity[:3])  # xyz components
+        else:
+            pos_velocity = np.zeros(3)
+            ori_vel_magnitude = 0.0
+
+        # Store current pose for next iteration
+        self._prev_pose = current_pose.copy()
+
+        # PD control: action = Kp * error - Kd * velocity
+        pos_action = self.kp_pos * pos_error - self.kd_pos * pos_velocity
+        ori_action = self.kp_ori * ori_error - self.kd_ori * ori_vel_magnitude * np.sign(ori_error)
+
+        # Combine and clip
+        action = np.concatenate([pos_action, ori_action, [self._gripper_target]])
+        action[:6] = np.clip(action[:6], -self.max_action, self.max_action)
+        action[6] = np.clip(action[6], -1.0, 1.0)
+
+        return action
     
     def position_error(self, current_pose: np.ndarray) -> float:
         """Get position error magnitude."""
