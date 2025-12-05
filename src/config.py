@@ -31,12 +31,10 @@ class SkillConfig:
     place_lower_speed: float = 0.02
     place_release_height: float = 0.05  # 5cm above surface
 
-    # Control gains - tuned for robosuite action space
-    # Lower P gains + higher D gains = smoother motion
-    kp_pos: float = 5.0   # Proportional gain for position
-    kp_ori: float = 2.0   # Proportional gain for orientation
-    kd_pos: float = 0.1   # Derivative gain for position (damping) - scaled for velocity in m/s
-    kd_ori: float = 0.05  # Derivative gain for orientation (damping)
+    # Control gains - tuned for robosuite OSC action space
+    # OSC already handles low-level damping, so we just need P gains
+    kp_pos: float = 6.0   # Proportional gain for position
+    kp_ori: float = 2.5   # Proportional gain for orientation
 
     # Safety limits
     max_action_magnitude: float = 1.0

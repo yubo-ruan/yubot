@@ -149,7 +149,7 @@ class CartesianPDController:
         self._prev_pose = None
     
     def compute_action(self, current_pose: np.ndarray) -> np.ndarray:
-        """Compute control action with PD control.
+        """Compute control action (P control only - OSC handles damping).
 
         Args:
             current_pose: Current 7D pose.
@@ -160,29 +160,25 @@ class CartesianPDController:
         if self._target_pose is None:
             return np.zeros(7)
 
-        # Position error (P term)
+        # Position error
         pos_error = self._target_pose[:3] - current_pose[:3]
 
-        # Orientation error (P term)
+        # Orientation error
         ori_error = quat_error(self._target_pose[3:7], current_pose[3:7])
 
-        # Compute velocity (D term) - approximate from pose difference
-        # Scale by assumed dt (~0.02s at 50Hz) to get proper velocity units
-        if self._prev_pose is not None:
-            pos_velocity = (current_pose[:3] - self._prev_pose[:3]) / 0.02
-            ori_velocity = quat_error(current_pose[3:7], self._prev_pose[3:7]) / 0.02
-        else:
-            pos_velocity = np.zeros(3)
-            ori_velocity = np.zeros(3)
+        # Compute raw P control
+        pos_action = self.kp_pos * pos_error
+        ori_action = self.kp_ori * ori_error
 
-        # Store current pose for next iteration
-        self._prev_pose = current_pose.copy()
+        # Limit action magnitude per-axis to prevent overshoot/jitter
+        # OSC expects small deltas - large deltas cause oscillation
+        max_pos_delta = 0.15  # Max 15cm/step position delta
+        max_ori_delta = 0.3   # Max orientation delta per step
 
-        # PD control: action = Kp * error - Kd * velocity
-        pos_action = self.kp_pos * pos_error - self.kd_pos * pos_velocity
-        ori_action = self.kp_ori * ori_error - self.kd_ori * ori_velocity
+        pos_action = np.clip(pos_action, -max_pos_delta, max_pos_delta)
+        ori_action = np.clip(ori_action, -max_ori_delta, max_ori_delta)
 
-        # Combine and clip
+        # Combine and apply overall clip
         action = np.concatenate([pos_action, ori_action, [self._gripper_target]])
         action[:6] = np.clip(action[:6], -self.max_action, self.max_action)
         action[6] = np.clip(action[6], -1.0, 1.0)

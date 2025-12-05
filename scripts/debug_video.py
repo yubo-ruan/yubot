@@ -2,8 +2,8 @@
 """Simple video debugging tool that overlays VLM planning info on episode videos.
 
 Usage:
-    python tools/debug_video.py <episode_json_path>
-    python tools/debug_video.py logs/evaluation/qwen_grounded_*/episode_0000_*.json
+    python scripts/debug_video.py <episode_json_path>
+    python scripts/debug_video.py logs/evaluation/qwen_grounded_*/episode_0000_*.json
 """
 
 import argparse
