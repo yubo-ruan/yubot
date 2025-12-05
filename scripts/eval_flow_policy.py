@@ -161,6 +161,8 @@ def add_debug_overlay(
     reward: float,
     task_description: str = "",
     success: bool = False,
+    pick_obj_name: str = "",
+    place_target_name: str = "",
 ) -> np.ndarray:
     """Add debug information overlay to frame with side panel."""
     if not HAS_CV2:
@@ -205,6 +207,18 @@ def add_debug_overlay(
                 line = word
         if line:
             cv2.putText(panel, line, (10, y_offset), font, font_scale * 0.9, color, 1)
+            y_offset += line_height
+        y_offset += 5
+
+    # VLM Grounding info
+    if pick_obj_name or place_target_name:
+        cv2.putText(panel, "VLM GROUNDING:", (10, y_offset), font, font_scale, (100, 200, 100), 1)
+        y_offset += line_height
+        if pick_obj_name:
+            cv2.putText(panel, f"  Pick: {pick_obj_name}", (10, y_offset), font, font_scale * 0.9, (255, 150, 100), 1)
+            y_offset += line_height
+        if place_target_name:
+            cv2.putText(panel, f"  Place: {place_target_name}", (10, y_offset), font, font_scale * 0.9, (100, 150, 255), 1)
             y_offset += line_height
         y_offset += 5
 
@@ -356,6 +370,8 @@ def run_episode(
     num_inference_steps: int = 10,
     debug_video: bool = True,
     task_description: str = "",
+    pick_obj_name: str = "",
+    place_target_name: str = "",
 ) -> dict:
     """Run a single evaluation episode.
 
@@ -429,6 +445,8 @@ def run_episode(
                     chunk_size=chunk_size,
                     reward=total_reward,
                     task_description=task_description,
+                    pick_obj_name=pick_obj_name,
+                    place_target_name=place_target_name,
                 )
                 debug_frames.append(debug_frame)
 
@@ -533,6 +551,8 @@ def run_single_task(task_args: dict) -> dict:
             num_inference_steps=num_inference_steps,
             debug_video=save_videos,
             task_description=task_description,
+            pick_obj_name=pick_obj,
+            place_target_name=place_target,
         )
 
         successes.append(result["success"])
