@@ -2,9 +2,12 @@
 
 Loads HDF5 demonstration files from LIBERO-Spatial and LIBERO-Object
 benchmarks for behavior cloning with flow matching.
+
+Uses oracle object positions from replaying demo states in the environment.
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -12,6 +15,14 @@ import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+# LIBERO environment imports (optional - used for oracle goal extraction)
+try:
+    from libero.libero.envs.env_wrapper import OffScreenRenderEnv
+    LIBERO_AVAILABLE = True
+except ImportError:
+    LIBERO_AVAILABLE = False
+    print("Warning: LIBERO environment not available. Using fallback goal extraction.")
 
 
 class LIBERODataset(Dataset):
@@ -25,6 +36,9 @@ class LIBERODataset(Dataset):
         chunk_size: Length of action chunks to sample
         img_size: Size to resize images to (H, W)
         camera_name: Which camera to use ('agentview_rgb' or 'eye_in_hand_rgb')
+        bddl_dir: Directory containing BDDL files for oracle goal extraction
+        use_oracle_goals: Whether to use oracle object positions as goals
+        place_height_offset: Height offset to add to place target position
     """
 
     def __init__(
@@ -33,10 +47,19 @@ class LIBERODataset(Dataset):
         chunk_size: int = 16,
         img_size: Tuple[int, int] = (128, 128),
         camera_name: str = "agentview_rgb",
+        bddl_dir: Optional[str] = None,
+        use_oracle_goals: bool = True,
+        place_height_offset: float = 0.05,
     ):
         self.chunk_size = chunk_size
         self.img_size = img_size
         self.camera_name = camera_name
+        self.bddl_dir = bddl_dir
+        self.use_oracle_goals = use_oracle_goals and LIBERO_AVAILABLE
+        self.place_height_offset = place_height_offset
+
+        if use_oracle_goals and not LIBERO_AVAILABLE:
+            print("Warning: Oracle goals requested but LIBERO not available. Using fallback.")
 
         # Load all demos into memory
         self.samples = []
@@ -44,14 +67,21 @@ class LIBERODataset(Dataset):
 
     def _load_demos(self, demo_paths: List[str]):
         """Load all demonstrations from HDF5 files."""
+        # Cache for oracle goal extraction environments
+        env_cache = {}
+
         for path in demo_paths:
             if not os.path.exists(path):
                 print(f"Warning: {path} not found, skipping")
                 continue
 
+            # Get oracle goals for this file if using oracle mode
+            oracle_goals = None
+            if self.use_oracle_goals and self.bddl_dir:
+                oracle_goals = self._get_oracle_goals_for_file(path, env_cache)
+
             with h5py.File(path, "r") as f:
                 data_grp = f["data"]
-                num_demos = data_grp.attrs.get("num_demos", 0)
 
                 # Iterate over demos
                 for demo_key in data_grp.keys():
@@ -59,7 +89,17 @@ class LIBERODataset(Dataset):
                         continue
 
                     demo = data_grp[demo_key]
-                    self._process_demo(demo, path)
+                    # Get oracle goal for this specific demo
+                    demo_idx = int(demo_key.split("_")[1])
+                    oracle_goal = oracle_goals.get(demo_idx) if oracle_goals else None
+                    self._process_demo(demo, path, oracle_goal=oracle_goal)
+
+        # Close any cached environments
+        for env in env_cache.values():
+            try:
+                env.close()
+            except:
+                pass
 
     def _process_demo(self, demo: h5py.Group, path: str):
         """Extract samples from a single demonstration."""

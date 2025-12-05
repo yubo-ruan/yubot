@@ -2,8 +2,9 @@
 """Evaluate flow matching policy on LIBERO tasks.
 
 Usage:
-    python scripts/eval_flow_policy.py --checkpoint checkpoints/pickandplace_best.pt
-    python scripts/eval_flow_policy.py --checkpoint checkpoints/pickandplace_best.pt --task_suite libero_spatial --num_episodes 10
+    python scripts/eval_flow_policy.py --task_id 0
+    python scripts/eval_flow_policy.py --task_ids 4 5 8 9 --task_suite libero_spatial
+    python scripts/eval_flow_policy.py --task_ids 0 1 2 --num_episodes 5
 """
 
 import argparse
@@ -11,6 +12,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
 import numpy as np
@@ -351,12 +353,132 @@ def run_episode(
     }
 
 
+def run_single_task(task_args: dict) -> dict:
+    """Run evaluation for a single task (used for parallel execution)."""
+    task_id = task_args["task_id"]
+    task_suite = task_args["task_suite"]
+    checkpoint = task_args["checkpoint"]
+    num_episodes = task_args["num_episodes"]
+    max_steps = task_args["max_steps"]
+    num_inference_steps = task_args["num_inference_steps"]
+    device = task_args["device"]
+    save_videos = task_args["save_videos"]
+    output_dir = task_args["output_dir"]
+    seed = task_args["seed"]
+
+    # Set seeds
+    np.random.seed(seed + task_id)
+    torch.manual_seed(seed + task_id)
+
+    # Check device
+    if device == "cuda" and not torch.cuda.is_available():
+        print(f"[Task {task_id}] CUDA not available, falling back to CPU")
+        device = "cpu"
+
+    # Load checkpoint
+    print(f"[Task {task_id}] Loading checkpoint: {checkpoint}")
+    checkpoint_data = torch.load(checkpoint, map_location=device)
+
+    # Get config from checkpoint
+    ckpt_args = checkpoint_data.get("args", {})
+    chunk_size = ckpt_args.get("chunk_size", 16)
+
+    # Create policy
+    policy = PickAndPlaceFlowPolicy(
+        action_dim=7,
+        chunk_size=chunk_size,
+        hidden_dim=256,
+        proprio_dim=8,
+        goal_dim=3,
+        pretrained_vision=False,
+    ).to(device)
+
+    policy.load_state_dict(checkpoint_data["model_state_dict"])
+    policy.eval()
+
+    # Create environment
+    print(f"[Task {task_id}] Creating environment: {task_suite} task {task_id}")
+    env, task_description = make_libero_env(task_suite, task_id)
+    print(f"[Task {task_id}] Task: {task_description}")
+
+    # Get initial obs to extract goal
+    init_obs = env.reset()
+    goal = extract_goal_from_obs(init_obs, task_description)
+
+    # Create output directory
+    output_path = Path(output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = output_path / f"{task_suite}_task{task_id}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Run evaluation
+    results = []
+    successes = []
+
+    for ep in range(num_episodes):
+        print(f"[Task {task_id}] Episode {ep + 1}/{num_episodes}")
+
+        result = run_episode(
+            env=env,
+            policy=policy,
+            goal=goal,
+            device=device,
+            max_steps=max_steps,
+            num_inference_steps=num_inference_steps,
+            debug_video=save_videos,
+            task_description=task_description,
+        )
+
+        successes.append(result["success"])
+        print(f"[Task {task_id}] Success: {result['success']}, Steps: {result['steps']}, Reward: {result['total_reward']:.2f}")
+
+        # Save debug video
+        if save_videos and len(result["debug_frames"]) > 0:
+            try:
+                import imageio
+                video_path = run_dir / f"episode_{ep:04d}_debug.mp4"
+                imageio.mimsave(str(video_path), result["debug_frames"], fps=20)
+            except ImportError:
+                pass
+
+        results.append({
+            "episode": ep,
+            "success": result["success"],
+            "steps": result["steps"],
+            "total_reward": result["total_reward"],
+        })
+
+    # Summary
+    success_rate = np.mean(successes)
+    print(f"[Task {task_id}] Success rate: {success_rate:.1%} ({sum(successes)}/{len(successes)})")
+
+    # Save results
+    summary = {
+        "task_suite": task_suite,
+        "task_id": task_id,
+        "task_description": task_description,
+        "checkpoint": checkpoint,
+        "num_episodes": num_episodes,
+        "success_rate": success_rate,
+        "results": results,
+        "args": task_args,
+    }
+
+    summary_path = run_dir / "summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    env.close()
+
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate flow policy on LIBERO")
     parser.add_argument(
         "--checkpoint",
         type=str,
-        required=True,
+        default="checkpoints/pickandplace_best.pt",
         help="Path to policy checkpoint",
     )
     parser.add_argument(
@@ -368,13 +490,26 @@ def main():
     parser.add_argument(
         "--task_id",
         type=int,
-        default=0,
-        help="Task ID within suite",
+        default=None,
+        help="Single task ID within suite (use --task_ids for multiple)",
+    )
+    parser.add_argument(
+        "--task_ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Multiple task IDs to run in parallel (e.g., --task_ids 4 5 8 9)",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers for multi-task evaluation",
     )
     parser.add_argument(
         "--num_episodes",
         type=int,
-        default=5,
+        default=1,
         help="Number of evaluation episodes",
     )
     parser.add_argument(
@@ -398,6 +533,7 @@ def main():
     parser.add_argument(
         "--save_videos",
         action="store_true",
+        default=True,
         help="Save episode videos",
     )
     parser.add_argument(
@@ -415,122 +551,55 @@ def main():
 
     args = parser.parse_args()
 
-    # Set seeds
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    # Determine task IDs to run
+    if args.task_ids is not None:
+        task_ids = args.task_ids
+    elif args.task_id is not None:
+        task_ids = [args.task_id]
+    else:
+        task_ids = [0]  # Default to task 0
 
-    # Check device
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available, falling back to CPU")
-        args.device = "cpu"
-
-    # Load checkpoint
-    print(f"Loading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=args.device)
-
-    # Get config from checkpoint
-    ckpt_args = checkpoint.get("args", {})
-    chunk_size = ckpt_args.get("chunk_size", 16)
-
-    # Create policy
-    policy = PickAndPlaceFlowPolicy(
-        action_dim=7,
-        chunk_size=chunk_size,
-        hidden_dim=256,
-        proprio_dim=8,
-        goal_dim=3,
-        pretrained_vision=False,  # Will load from checkpoint
-    ).to(args.device)
-
-    policy.load_state_dict(checkpoint["model_state_dict"])
-    policy.eval()
-    print(f"Loaded policy from epoch {checkpoint.get('epoch', 'unknown')}")
-
-    # Create environment
-    print(f"Creating environment: {args.task_suite} task {args.task_id}")
-    env, task_description = make_libero_env(args.task_suite, args.task_id)
-    print(f"Task: {task_description}")
-
-    # Get initial obs to extract goal
-    init_obs = env.reset()
-
-    # Extract goal position from obs
-    goal = extract_goal_from_obs(init_obs, task_description)
-    print(f"Goal position: {goal}")
-
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = output_dir / f"{args.task_suite}_task{args.task_id}_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Run evaluation
-    results = []
-    successes = []
-
-    print(f"\nRunning {args.num_episodes} episodes...")
-    for ep in range(args.num_episodes):
-        print(f"\n=== Episode {ep + 1}/{args.num_episodes} ===")
-
-        result = run_episode(
-            env=env,
-            policy=policy,
-            goal=goal,
-            device=args.device,
-            max_steps=args.max_steps,
-            num_inference_steps=args.num_inference_steps,
-            debug_video=args.save_videos,
-            task_description=task_description,
-        )
-
-        successes.append(result["success"])
-        print(f"Success: {result['success']}, Steps: {result['steps']}, Reward: {result['total_reward']:.2f}")
-
-        # Save debug video with overlay (uses debug_frames with side panel)
-        if args.save_videos and len(result["debug_frames"]) > 0:
-            try:
-                import imageio
-                video_path = run_dir / f"episode_{ep:04d}_debug.mp4"
-                imageio.mimsave(str(video_path), result["debug_frames"], fps=20)
-                print(f"Saved debug video: {video_path}")
-            except ImportError:
-                print("imageio not installed, skipping video save")
-
-        # Store result (without frames to save memory)
-        results.append({
-            "episode": ep,
-            "success": result["success"],
-            "steps": result["steps"],
-            "total_reward": result["total_reward"],
+    # Build task arguments for each task
+    task_args_list = []
+    for tid in task_ids:
+        task_args_list.append({
+            "task_id": tid,
+            "task_suite": args.task_suite,
+            "checkpoint": args.checkpoint,
+            "num_episodes": args.num_episodes,
+            "max_steps": args.max_steps,
+            "num_inference_steps": args.num_inference_steps,
+            "device": args.device,
+            "save_videos": args.save_videos,
+            "output_dir": args.output_dir,
+            "seed": args.seed,
         })
 
-    # Summary
-    success_rate = np.mean(successes)
-    print(f"\n{'='*50}")
-    print(f"RESULTS: {args.task_suite} task {args.task_id}")
-    print(f"{'='*50}")
-    print(f"Success rate: {success_rate:.1%} ({sum(successes)}/{len(successes)})")
-    print(f"Avg steps: {np.mean([r['steps'] for r in results]):.1f}")
-    print(f"Avg reward: {np.mean([r['total_reward'] for r in results]):.2f}")
+    # Run tasks
+    if len(task_ids) == 1:
+        # Single task: run directly
+        print(f"Running single task: {task_ids[0]}")
+        summaries = [run_single_task(task_args_list[0])]
+    else:
+        # Multiple tasks: run in parallel
+        num_workers = min(args.num_workers, len(task_ids))
+        print(f"Running {len(task_ids)} tasks in parallel with {num_workers} workers")
+        print(f"Task IDs: {task_ids}")
 
-    # Save results
-    summary = {
-        "task_suite": args.task_suite,
-        "task_id": args.task_id,
-        "task_description": task_description,
-        "checkpoint": args.checkpoint,
-        "num_episodes": args.num_episodes,
-        "success_rate": success_rate,
-        "results": results,
-        "args": vars(args),
-    }
+        with Pool(processes=num_workers) as pool:
+            summaries = pool.map(run_single_task, task_args_list)
 
-    summary_path = run_dir / "summary.json"
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"\nResults saved to: {run_dir}")
+    # Print overall summary
+    print(f"\n{'='*60}")
+    print(f"OVERALL RESULTS: {args.task_suite}")
+    print(f"{'='*60}")
+    for s in summaries:
+        status = "PASS" if s["success_rate"] > 0 else "FAIL"
+        print(f"  Task {s['task_id']:2d}: {s['success_rate']:5.1%} - {s['task_description'][:50]}...")
 
-    env.close()
+    overall_rate = np.mean([s["success_rate"] for s in summaries])
+    print(f"{'='*60}")
+    print(f"Overall success rate: {overall_rate:.1%}")
 
 
 if __name__ == "__main__":
