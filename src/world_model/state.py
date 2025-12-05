@@ -6,10 +6,8 @@ This enables multi-step reasoning and skill precondition checking.
 
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
 import numpy as np
-
-from ..perception.interface import PerceptionResult
 
 
 @dataclass
@@ -84,7 +82,7 @@ class WorldState:
     last_perception_time: float = 0.0
     stale_threshold: float = 1.0  # seconds
     
-    def update_from_perception(self, perception: PerceptionResult):
+    def update_from_perception(self, perception: Any):
         """Update world state from perception result.
 
         Reconciles symbolic state with new perception data.

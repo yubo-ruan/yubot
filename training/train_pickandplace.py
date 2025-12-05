@@ -4,22 +4,23 @@
 Usage:
     python training/train_pickandplace.py --libero_dir /path/to/libero/datasets
 
+    # With W&B logging:
+    python training/train_pickandplace.py --libero_dir /path/to/libero/datasets --wandb
+
 The script expects LIBERO demo files in:
     {libero_dir}/libero_spatial/*.hdf5
     {libero_dir}/libero_object/*.hdf5
 
-Outputs are saved to yubot/training/:
-    - checkpoints/: Model checkpoints
-    - logs/: Training logs
+Outputs:
+    - training/checkpoints/: Model checkpoints
+    - W&B dashboard (if --wandb enabled)
 """
 
 import argparse
-import json
-import os
 import sys
 from pathlib import Path
-from datetime import datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -36,6 +37,7 @@ sys.path.insert(0, str(YUBOT_DIR))
 
 from src.policy.flow_policy import PickAndPlaceFlowPolicy, flow_matching_loss
 from training.data.libero_dataset import get_libero_dataloaders
+from training.wandb_logger import WandbLogger
 
 
 def freeze_vision_encoder(policy: nn.Module):
@@ -55,16 +57,24 @@ def train_epoch(
     train_loader,
     optimizer,
     device: str,
+    logger: WandbLogger,
+    epoch: int,
+    global_step: int,
     scaler: GradScaler = None,
     use_amp: bool = True,
-) -> float:
-    """Train for one epoch with optional mixed precision."""
+    log_interval: int = 50,
+) -> tuple:
+    """Train for one epoch with optional mixed precision.
+
+    Returns:
+        (avg_loss, global_step)
+    """
     policy.train()
     total_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(train_loader, desc="Training")
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         # Move to device
         image = batch["image"].to(device)
         proprio = batch["proprio"].to(device)
@@ -80,21 +90,38 @@ def train_epoch(
             # Scaled backward pass
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             # Standard forward/backward
             loss = flow_matching_loss(policy, image, proprio, goal, actions)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             optimizer.step()
 
-        total_loss += loss.item()
+        loss_val = loss.item()
+        total_loss += loss_val
         num_batches += 1
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        global_step += 1
+        pbar.set_postfix({"loss": f"{loss_val:.4f}"})
 
-    return total_loss / num_batches
+        # Log to W&B
+        if batch_idx % log_interval == 0:
+            logger.log({
+                "train/loss": loss_val,
+                "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                "train/epoch": epoch,
+                "train/step": global_step,
+            })
+
+            # Log sample image every 200 steps
+            if batch_idx % (log_interval * 4) == 0:
+                logger.log_image("samples/input_image", image[0])
+                logger.log_histogram("samples/actions", actions.cpu().numpy().flatten())
+                logger.log_histogram("samples/goal", goal.cpu().numpy().flatten())
+
+    return total_loss / num_batches, global_step
 
 
 @torch.no_grad()
@@ -143,14 +170,21 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4, help="Dataloader workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision training")
-    parser.add_argument("--freeze_vision_epochs", type=int, default=0, help="Freeze vision encoder for first N epochs (0 = never freeze)")
-    parser.add_argument("--temporal_stride", type=int, default=1, help="Sample every Nth timestep (reduces samples, increases diversity)")
-    parser.add_argument("--augment", action="store_true", help="Enable data augmentation (ColorJitter, RandomAffine)")
+    parser.add_argument("--freeze_vision_epochs", type=int, default=0, help="Freeze vision encoder for first N epochs")
+    parser.add_argument("--temporal_stride", type=int, default=1, help="Sample every Nth timestep")
+    parser.add_argument("--augment", action="store_true", help="Enable data augmentation")
+
+    # W&B arguments
+    parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
+    parser.add_argument("--wandb_project", type=str, default="yubot-flow-policy", help="W&B project name")
+    parser.add_argument("--wandb_name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None, help="W&B tags")
 
     args = parser.parse_args()
 
     # Set seed
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     # Create output directory (default to training/checkpoints)
     if args.output_dir is None:
@@ -159,16 +193,21 @@ def main():
         output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create logs directory
-    log_dir = TRAINING_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
     # Check device
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU")
         args.device = "cpu"
 
     print(f"Using device: {args.device}")
+
+    # Initialize W&B logger
+    logger = WandbLogger(
+        enabled=args.wandb,
+        project=args.wandb_project,
+        config=vars(args),
+        run_name=args.wandb_name,
+        tags=args.wandb_tags,
+    )
 
     # Create dataloaders
     print("Loading LIBERO demos...")
@@ -200,6 +239,9 @@ def main():
     num_params = sum(p.numel() for p in policy.parameters())
     print(f"Policy parameters: {num_params:,}")
 
+    # Watch model with W&B (logs gradients)
+    logger.watch(policy, log="gradients", log_freq=100)
+
     # Optimizer and scheduler
     optimizer = AdamW(policy.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
@@ -221,15 +263,11 @@ def main():
 
     # Training loop
     best_val_loss = float("inf")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Create log file
-    log_file = log_dir / f"train_{timestamp}.log"
-    training_history = []
+    global_step = 0
 
     print(f"\nStarting training for {args.epochs} epochs...")
     print(f"Checkpoints: {output_dir}")
-    print(f"Log file: {log_file}")
+
     for epoch in range(args.epochs):
         # Unfreeze vision encoder after N epochs
         if vision_frozen and epoch >= args.freeze_vision_epochs:
@@ -240,7 +278,10 @@ def main():
         print(f"\n=== Epoch {epoch + 1}/{args.epochs} ===")
 
         # Train
-        train_loss = train_epoch(policy, train_loader, optimizer, args.device, scaler, use_amp)
+        train_loss, global_step = train_epoch(
+            policy, train_loader, optimizer, args.device,
+            logger, epoch + 1, global_step, scaler, use_amp
+        )
         print(f"Train loss: {train_loss:.4f}")
 
         # Validate
@@ -249,7 +290,16 @@ def main():
 
         # Step scheduler
         scheduler.step()
-        print(f"LR: {scheduler.get_last_lr()[0]:.6f}")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"LR: {current_lr:.6f}")
+
+        # Log epoch metrics to W&B
+        logger.log({
+            "epoch/train_loss": train_loss,
+            "epoch/val_loss": val_loss,
+            "epoch/lr": current_lr,
+            "epoch/epoch": epoch + 1,
+        })
 
         # Save checkpoint
         checkpoint = {
@@ -262,41 +312,27 @@ def main():
         }
 
         # Save latest
-        torch.save(checkpoint, output_dir / f"pickandplace_latest.pt")
+        torch.save(checkpoint, output_dir / "pickandplace_latest.pt")
 
         # Save best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(checkpoint, output_dir / f"pickandplace_best.pt")
+            torch.save(checkpoint, output_dir / "pickandplace_best.pt")
             print(f"New best model! Val loss: {val_loss:.4f}")
+            logger.set_summary("best_val_loss", best_val_loss)
+            logger.set_summary("best_epoch", epoch + 1)
 
         # Save periodic checkpoint
         if (epoch + 1) % 10 == 0:
             torch.save(checkpoint, output_dir / f"pickandplace_epoch{epoch + 1}.pt")
 
-        # Log to history
-        training_history.append({
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "lr": scheduler.get_last_lr()[0],
-            "best_val_loss": best_val_loss,
-        })
-
-    # Save training log
-    log_data = {
-        "args": vars(args),
-        "timestamp": timestamp,
-        "num_params": num_params,
-        "best_val_loss": best_val_loss,
-        "history": training_history,
-    }
-    with open(log_file, "w") as f:
-        json.dump(log_data, f, indent=2)
+    # Finish W&B run
+    logger.set_summary("final_train_loss", train_loss)
+    logger.set_summary("final_val_loss", val_loss)
+    logger.finish()
 
     print(f"\nTraining complete! Best val loss: {best_val_loss:.4f}")
     print(f"Checkpoints saved to: {output_dir}")
-    print(f"Training log saved to: {log_file}")
 
 
 if __name__ == "__main__":
